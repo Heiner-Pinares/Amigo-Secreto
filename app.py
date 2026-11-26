@@ -113,17 +113,17 @@ def parse_csv_participants(raw: str, existing_emails: set[str]) -> tuple[list[di
 
 
 XLSX_ALIASES = {
-    "name": {
-        "nombre", "nombre completo", "nombres", "nombres y apellidos", "nombre y apellidos",
-        "participante", "name", "full name",
-    },
-    "email": {"correo", "correo electronico", "email", "e-mail", "mail"},
-    "gifts": {
+    "name": (
+        "nombre", "nombre completo", "nombre y apellidos completos", "nombres",
+        "nombres y apellidos", "nombre y apellidos", "participante", "name", "full name",
+    ),
+    "email": ("correo c", "correo electronico", "correo", "email", "e-mail", "mail"),
+    "gifts": (
         "regalos", "regalos deseados", "lista de regalos", "preferencias", "preferencias de regalo",
         "que te gustaria recibir", "que regalo te gustaria recibir", "gifts", "gift preferences",
-    },
-    "area": {"area", "equipo", "gerencia", "departamento", "team", "department"},
-    "confirmed": {"confirmado", "confirmacion", "participa", "asistira", "confirmed"},
+    ),
+    "area": ("area", "equipo", "gerencia", "departamento", "team", "department"),
+    "confirmed": ("confirmado", "confirmacion", "participa", "asistira", "confirmed"),
 }
 
 
@@ -166,8 +166,23 @@ def parse_xlsx_participants(raw: bytes) -> tuple[list[dict], list[dict], str]:
                     canonical: next((normalized[item] for item in aliases if item in normalized), None)
                     for canonical, aliases in XLSX_ALIASES.items()
                 }
-                if all(columns[item] is not None for item in ("name", "email", "gifts")):
-                    selected = (sheet, row_number, columns)
+                gift_columns = []
+                for index, value in enumerate(row):
+                    if value is None or not str(value).strip():
+                        continue
+                    normalized_header = field_name(str(value))
+                    plain_header = " ".join(
+                        "".join(char if char.isalnum() else " " for char in normalized_header).split()
+                    )
+                    if (
+                        normalized_header in XLSX_ALIASES["gifts"]
+                        or plain_header in XLSX_ALIASES["gifts"]
+                        or plain_header == "regalo"
+                        or plain_header.startswith("regalo ")
+                    ):
+                        gift_columns.append(index)
+                if columns["name"] is not None and columns["email"] is not None and gift_columns:
+                    selected = (sheet, row_number, columns, gift_columns)
                     break
             if selected:
                 break
@@ -176,7 +191,7 @@ def parse_xlsx_participants(raw: bytes) -> tuple[list[dict], list[dict], str]:
                 "No encuentro las columnas obligatorias: Nombre completo, Correo y Regalos."
             )
 
-        sheet, header_row, columns = selected
+        sheet, header_row, columns, gift_columns = selected
         valid, invalid, seen = [], [], set()
         max_row = min(sheet.max_row, 10_001)
         for row_number, row in enumerate(
@@ -192,10 +207,21 @@ def parse_xlsx_participants(raw: bytes) -> tuple[list[dict], list[dict], str]:
                     return ""
                 return str(row[index]).strip()
 
+            gift_values = [
+                str(row[index]).strip()
+                for index in gift_columns
+                if index < len(row) and row[index] is not None and str(row[index]).strip()
+            ]
+            gifts = (
+                "\n".join(f"Regalo {position}: {value}" for position, value in enumerate(gift_values, start=1))
+                if len(gift_columns) > 1
+                else (gift_values[0] if gift_values else "")
+            )
+
             payload = {
                 "name": db.clean_text(cell("name")),
                 "email": db.normalize_email(cell("email")),
-                "gifts": cell("gifts"),
+                "gifts": gifts,
                 "area": db.clean_text(cell("area")),
             }
             confirmation = field_name(cell("confirmed")) if columns.get("confirmed") is not None else "si"

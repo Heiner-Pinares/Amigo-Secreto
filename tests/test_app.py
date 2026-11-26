@@ -167,6 +167,38 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "columnas obligatorias"):
             parse_xlsx_participants(raw)
 
+    def test_xlsx_imports_the_corporate_form_with_three_gift_columns(self):
+        raw = make_xlsx(
+            [
+                "ID",
+                "Correo electrónico",
+                "Nombre",
+                "Código C (Ejm. CXXXXX)",
+                "Nombre y Apellidos (Completos)",
+                "Correo C",
+                "🎁 Regalo 1",
+                "🎁 Regalo 2",
+                "🎁 Regalo 3",
+            ],
+            [[
+                2,
+                "respuesta@example.test",
+                "Nombre Completo Correcto",
+                "C12345",
+                "Solo Apellidos",
+                "corporativo@claro.com.pe",
+                "Libro",
+                "Taza",
+                "Dulces",
+            ]],
+        )
+        valid, invalid, _ = parse_xlsx_participants(raw)
+        self.assertEqual([], invalid)
+        self.assertEqual(1, len(valid))
+        self.assertEqual("Nombre Completo Correcto", valid[0]["name"])
+        self.assertEqual("corporativo@claro.com.pe", valid[0]["email"])
+        self.assertEqual("Regalo 1: Libro\nRegalo 2: Taza\nRegalo 3: Dulces", valid[0]["gifts"])
+
 
 class WebSecurityAndMailTests(unittest.TestCase):
     def setUp(self):
