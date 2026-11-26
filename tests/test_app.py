@@ -282,6 +282,38 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.assertIsNone(event["preview_json"])
         self.assertEqual(1, remaining)
 
+    def test_admin_can_reset_confirmed_draw_and_keep_participants(self):
+        ids = self.seed_confirmed_draw(3)
+        with db.connect(self.app.database_path) as conn:
+            conn.execute(
+                "UPDATE assignments SET mail_status='accepted' WHERE giver_id=?",
+                (ids[0],),
+            )
+        self.client.login()
+        status, body, _ = self.client.request("/admin")
+        self.assertEqual(200, status)
+        self.assertIn("Restablecer sorteo", body)
+        status, body, _ = self.client.request(
+            "/admin/draw/reset",
+            "POST",
+            {"csrf": self.client.csrf()},
+        )
+        self.assertEqual(200, status)
+        self.assertIn("Sorteo restablecido", body)
+        self.assertIn("no pueden recuperarse", body)
+        with db.connect(self.app.database_path) as conn:
+            event = conn.execute(
+                "SELECT status,draw_id,confirmed_at FROM events WHERE id=?",
+                (self.app.event_id,),
+            ).fetchone()
+            assignments = conn.execute("SELECT COUNT(*) AS n FROM assignments").fetchone()["n"]
+            participants = conn.execute("SELECT COUNT(*) AS n FROM participants").fetchone()["n"]
+        self.assertEqual("open", event["status"])
+        self.assertIsNone(event["draw_id"])
+        self.assertIsNone(event["confirmed_at"])
+        self.assertEqual(0, assignments)
+        self.assertEqual(3, participants)
+
     def test_excel_upload_replaces_existing_list(self):
         with db.connect(self.app.database_path) as conn:
             db.add_participant(

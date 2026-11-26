@@ -316,6 +316,7 @@ class Application:
                 "/admin/draw/preview": self.draw_preview,
                 "/admin/draw/cancel": self.cancel_preview,
                 "/admin/draw/confirm": self.confirm_draw,
+                "/admin/draw/reset": self.reset_draw,
                 "/admin/mail/send": self.send_pending,
                 "/admin/mail/retry": self.retry_failed,
                 "/admin/mail/test": self.send_test_mail,
@@ -422,7 +423,8 @@ class Application:
                 else "<div class='notice error'><strong>Modo real activo:</strong> los mensajes se enviarán a los participantes.</div>"
             )
             send_summary = f"""<div class="send-summary"><p><strong>{len(active)}</strong> participantes · <strong>{assignment_count}</strong> asignaciones válidas · <strong>{pending_count}</strong> pendientes</p><p>Conexión SSH: <strong>{html.escape(connection_status)}</strong></p>{mode_notice}</div>"""
-            draw_actions = f"""{disabled_note}{send_summary}<div class="actions"><form method="post" action="/admin/mail/send"><input type="hidden" name="csrf" value="{csrf}"><label>Escribe ENVIAR CORREOS para confirmar<input name="confirmation" autocomplete="off" required></label><button class="primary" {'disabled' if not batch_enabled else ''}>Enviar correos pendientes</button></form><form method="post" action="/admin/mail/retry"><input type="hidden" name="csrf" value="{csrf}"><label>Escribe ENVIAR CORREOS para reintentar<input name="confirmation" autocomplete="off" required></label><button {'disabled' if not batch_enabled else ''}>Reintentar solo fallidos</button></form></div>"""
+            reset_warning = "Este sorteo tiene correos aceptados que no pueden recuperarse. " if statuses.get("accepted", 0) else ""
+            draw_actions = f"""{disabled_note}{send_summary}<div class="actions"><form method="post" action="/admin/mail/send"><input type="hidden" name="csrf" value="{csrf}"><label>Escribe ENVIAR CORREOS para confirmar<input name="confirmation" autocomplete="off" required></label><button class="primary" {'disabled' if not batch_enabled else ''}>Enviar correos pendientes</button></form><form method="post" action="/admin/mail/retry"><input type="hidden" name="csrf" value="{csrf}"><label>Escribe ENVIAR CORREOS para reintentar<input name="confirmation" autocomplete="off" required></label><button {'disabled' if not batch_enabled else ''}>Reintentar solo fallidos</button></form></div><div class="reset-draw"><p class="muted">¿Necesitas corregir la lista? Restablecer conserva los participantes, pero elimina las asignaciones y sus estados de envío.</p><form method="post" action="/admin/draw/reset" data-confirm="{reset_warning}Se eliminarán las asignaciones y los estados de envío de este sorteo. ¿Restablecer ahora?"><input type="hidden" name="csrf" value="{csrf}"><button class="danger">Restablecer sorteo</button></form></div>"""
         test_enabled = self.mail_enabled and bool(self.mail_test_recipient)
         mail_state = "Configuración válida" if self.mail_enabled else "Envío deshabilitado"
         if self.mail_config_error:
@@ -589,6 +591,39 @@ class Application:
         except DrawError as exc:
             return self.response("409 Conflict", self.admin_page(session, str(exc)))
         return self.response("200 OK", self.admin_page(session, "Sorteo confirmado y guardado definitivamente. Aún no se enviaron correos."))
+
+    def reset_draw(self, session, form):
+        if not self.send_lock.acquire(blocking=False):
+            return self.response("409 Conflict", self.admin_page(session, "Espera a que termine la operación de correo antes de restablecer el sorteo."))
+        try:
+            with db.connect(self.database_path) as conn, db.transaction(conn):
+                event = conn.execute(
+                    "SELECT status FROM events WHERE id=?",
+                    (self.event_id,),
+                ).fetchone()
+                if not event or event["status"] != "confirmed":
+                    return self.response("409 Conflict", self.admin_page(session, "El sorteo no está confirmado o ya fue restablecido."))
+                counts = conn.execute(
+                    "SELECT COUNT(*) AS total, SUM(CASE WHEN mail_status='accepted' THEN 1 ELSE 0 END) AS accepted FROM assignments WHERE event_id=?",
+                    (self.event_id,),
+                ).fetchone()
+                total = counts["total"] or 0
+                accepted = counts["accepted"] or 0
+                conn.execute("DELETE FROM assignments WHERE event_id=?", (self.event_id,))
+                conn.execute(
+                    "UPDATE events SET status='open',preview_json=NULL,preview_hash=NULL,draw_id=NULL,confirmed_at=NULL WHERE id=?",
+                    (self.event_id,),
+                )
+                conn.execute(
+                    "INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)",
+                    (self.event_id, "draw_reset", "admin", f"assignments_deleted={total};accepted_before_reset={accepted}", db.now()),
+                )
+            message = "Sorteo restablecido. Ya puedes editar participantes y volver a sortear."
+            if accepted:
+                message += f" Atención: {accepted} correo(s) ya habían sido aceptados y no pueden recuperarse."
+            return self.response("200 OK", self.admin_page(session, message))
+        finally:
+            self.send_lock.release()
 
     def send_pending(self, session, form):
         return self.process_mail(session, form, retry_failed=False)
