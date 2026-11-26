@@ -86,12 +86,16 @@ def clean_text(value: str) -> str:
     return " ".join(value.strip().split())
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
+@contextmanager
+def connect(path: str | Path):
     conn = sqlite3.connect(str(path), timeout=10, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 10000")
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def initialize(path: str | Path, event_name: str) -> str:
