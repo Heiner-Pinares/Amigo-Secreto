@@ -1,12 +1,12 @@
 # Amigo secreto de Año Nuevo
 
-Aplicación web para registrar o importar participantes, configurar restricciones, confirmar un sorteo completo y enviar los resultados mediante el mecanismo corporativo SSH → `sendmail`.
+Portal privado para que un único administrador cargue participantes desde Excel, confirme un sorteo completo y envíe los resultados mediante el mecanismo corporativo SSH → `sendmail`.
 
 ## Arquitectura
 
-- Python 3.11 o posterior y Paramiko para SSH.
+- Python 3.11 o posterior, Paramiko para SSH y openpyxl para leer archivos `.xlsx`.
 - Servidor WSGI local y SQLite.
-- HTML/CSS/JavaScript sin frameworks de navegador.
+- HTML/CSS/JavaScript sin frameworks de navegador y sin formulario público de inscripción.
 - Sesiones administrativas, autorización y CSRF en todas las acciones POST.
 - Servicio `SshSendmailService` desacoplado en `secret_gift/mail.py`.
 - Sorteo guardado transaccionalmente antes de cualquier envío.
@@ -37,22 +37,32 @@ py -m unittest -v
 py app.py
 ```
 
-Abre `http://127.0.0.1:8000` y usa `/admin` para administrar el evento.
+Abre `http://127.0.0.1:8000`. La raíz redirige al acceso privado `/admin`; no existe registro público.
 
-## Importar participantes
+## Cargar participantes desde Excel
 
-El formulario público valida nombre, correo, preferencias, área opcional y confirmación. El panel también admite CSV exportado desde Excel con columnas `nombre`, `correo`, `regalos` y, opcionalmente, `area` y `confirmado`.
+El administrador selecciona directamente un archivo `.xlsx` en el panel. El libro debe contener una hoja con estas columnas, aunque se aceptan nombres equivalentes:
 
-La importación normaliza espacios y correos, detecta duplicados, presenta filas inválidas antes de guardar y nunca borra participantes existentes.
+- `Nombre completo`
+- `Correo` o `Correo electrónico`
+- `Regalos` o `Preferencias`
+- `Área`, `Equipo` o `Gerencia` (opcional)
+- `Confirmado` (opcional)
+
+La aplicación localiza los encabezados dentro de las primeras diez filas, normaliza espacios y correos, detecta duplicados y presenta errores antes de guardar. Solo se acepta la lista cuando contiene al menos dos participantes y ninguna fila inválida.
+
+Al confirmar la importación, la nueva lista reemplaza la lista anterior antes de preparar el sorteo. El archivo está limitado a 5 MB y su contenido descomprimido a 25 MB.
 
 ## Preparar el sorteo
 
-1. Revisa participantes, preferencias y áreas.
-2. Configura fecha, hora, lugar, presupuesto e instrucciones.
-3. Agrega restricciones opcionales.
-4. Pulsa **Generar vista previa del sorteo**.
-5. La aplicación valida la asignación completa sin enviar correos.
-6. Pulsa **Confirmar sorteo**.
+1. Inicia sesión en el portal privado.
+2. Carga el Excel y pulsa **Usar esta lista de participantes**.
+3. Revisa participantes, preferencias y áreas.
+4. Configura fecha, hora, lugar, presupuesto e instrucciones.
+5. Agrega restricciones opcionales si son necesarias.
+6. Pulsa **Generar vista previa del sorteo**.
+7. La aplicación valida la asignación completa sin mostrar los pares ni enviar correos.
+8. Pulsa **Confirmar sorteo**.
 
 Cada persona regala y recibe exactamente una vez, nadie se asigna a sí mismo y no existen destinatarios repetidos. Confirmar guarda todas las asignaciones en una transacción; enviar correos nunca vuelve a generar el sorteo.
 
@@ -155,7 +165,7 @@ Los logs de auditoría guardan identificadores, administrador, fecha, duración,
 py -m unittest -v
 ```
 
-Las pruebas simulan Paramiko y nunca abren una conexión real. Cubren conexión exitosa; contraseña ausente o vacía; `known_hosts` ausente; clave desconocida o cambiada; autenticación rechazada; timeout; código no cero de `sendmail`; límite de `stderr`; destinatarios inválidos e inyección; modo de prueba; MIME HTML/texto; idempotencia; reintento de fallidos; permisos administrativos; CSRF; rollback y validez del sorteo.
+Las pruebas simulan Paramiko y nunca abren una conexión real. Cubren importación y reemplazo desde Excel; ausencia de registro público; conexión SSH exitosa; contraseña ausente o vacía; `known_hosts` ausente; clave desconocida o cambiada; autenticación rechazada; timeout; código no cero de `sendmail`; límite de `stderr`; destinatarios inválidos e inyección; modo de prueba; MIME HTML/texto; idempotencia; reintento de fallidos; permisos administrativos; CSRF; rollback y validez del sorteo.
 
 ## Secretos que nunca deben versionarse
 

@@ -1,16 +1,30 @@
 from __future__ import annotations
 
 import io
+import base64
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import urlencode
 
-from app import Application, parse_csv_participants
+from app import Application, parse_csv_participants, parse_xlsx_participants
 from secret_gift import db
 from secret_gift.drawing import DrawError, DrawParticipant, generate_draw, validate_draw
 from secret_gift.mail import MailResult, render_assignment_mail
+from openpyxl import Workbook
+
+
+def make_xlsx(headers, rows):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(headers)
+    for row in rows:
+        sheet.append(row)
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
 
 
 class FakeMailService:
@@ -135,6 +149,24 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(1, len(valid))
         self.assertEqual(3, len(invalid))
 
+    def test_xlsx_import_recognizes_required_columns(self):
+        raw = make_xlsx(
+            ["Nombre completo", "Correo electrónico", "Regalos deseados", "Área"],
+            [
+                ["Ana Uno", "ana@example.test", "Libro", "Ventas"],
+                ["Luis Dos", "luis@example.test", "Taza", "TI"],
+            ],
+        )
+        valid, invalid, sheet = parse_xlsx_participants(raw)
+        self.assertEqual("Sheet", sheet)
+        self.assertEqual(2, len(valid))
+        self.assertEqual([], invalid)
+
+    def test_xlsx_missing_columns_is_rejected(self):
+        raw = make_xlsx(["ID"], [[1]])
+        with self.assertRaisesRegex(ValueError, "columnas obligatorias"):
+            parse_xlsx_participants(raw)
+
 
 class WebSecurityAndMailTests(unittest.TestCase):
     def setUp(self):
@@ -169,7 +201,10 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.assertIn("CSRF", body)
 
     def test_credentials_are_not_exposed_to_browser(self):
-        status, body, _ = self.client.request("/")
+        status, _, headers = self.client.request("/")
+        self.assertEqual(303, status)
+        self.assertIn(("Location", "/admin"), headers)
+        status, body, _ = self.client.request("/admin")
         self.assertEqual(200, status)
         self.assertNotIn("test-password", body)
         self.assertNotIn("SECRET_GIFT_MAIL_TOKEN", body)
@@ -177,6 +212,61 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.assertNotIn("172.19.30.62", body)
         self.assertNotIn("usr_mds", body)
         self.assertNotIn("secret_gift_ssh_password", body)
+
+    def test_public_registration_is_not_available(self):
+        self.client.request("/admin")
+        status, body, _ = self.client.request(
+            "/register",
+            "POST",
+            {
+                "csrf": self.client.csrf(),
+                "name": "Persona Pública",
+                "email": "public@example.test",
+                "gifts": "Libro",
+                "confirmed": "yes",
+            },
+        )
+        self.assertEqual(404, status)
+        self.assertNotIn("Confirmar inscripción", body)
+
+    def test_excel_upload_replaces_existing_list(self):
+        with db.connect(self.app.database_path) as conn:
+            db.add_participant(
+                conn,
+                self.app.event_id,
+                name="Persona Anterior",
+                email="old@example.test",
+                gifts="Regalo anterior",
+            )
+        raw = make_xlsx(
+            ["Nombre completo", "Correo", "Regalos", "Equipo"],
+            [
+                ["Ana Nueva", "ana@example.test", "Libro", "Ventas"],
+                ["Luis Nuevo", "luis@example.test", "Taza", "TI"],
+            ],
+        )
+        self.client.login()
+        status, _, _ = self.client.request(
+            "/admin/import/preview",
+            "POST",
+            {
+                "csrf": self.client.csrf(),
+                "filename": "participantes.xlsx",
+                "xlsx_base64": base64.b64encode(raw).decode(),
+            },
+        )
+        self.assertEqual(303, status)
+        sid = self.client.cookie.split("=", 1)[1]
+        token = self.app.sessions[sid]["import_preview"]["token"]
+        status, _, _ = self.client.request(
+            "/admin/import/commit",
+            "POST",
+            {"csrf": self.client.csrf(), "token": token},
+        )
+        self.assertEqual(200, status)
+        with db.connect(self.app.database_path) as conn:
+            emails = {row["email"] for row in conn.execute("SELECT email FROM participants")}
+        self.assertEqual({"ana@example.test", "luis@example.test"}, emails)
 
     def test_preview_does_not_send_mail(self):
         with db.connect(self.app.database_path) as conn:

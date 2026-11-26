@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import hashlib
 import hmac
 import html
@@ -12,6 +13,7 @@ import threading
 import time
 import traceback
 import unicodedata
+import zipfile
 from http import cookies
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -110,6 +112,112 @@ def parse_csv_participants(raw: str, existing_emails: set[str]) -> tuple[list[di
     return valid, invalid
 
 
+XLSX_ALIASES = {
+    "name": {
+        "nombre", "nombre completo", "nombres", "nombres y apellidos", "nombre y apellidos",
+        "participante", "name", "full name",
+    },
+    "email": {"correo", "correo electronico", "email", "e-mail", "mail"},
+    "gifts": {
+        "regalos", "regalos deseados", "lista de regalos", "preferencias", "preferencias de regalo",
+        "que te gustaria recibir", "que regalo te gustaria recibir", "gifts", "gift preferences",
+    },
+    "area": {"area", "equipo", "gerencia", "departamento", "team", "department"},
+    "confirmed": {"confirmado", "confirmacion", "participa", "asistira", "confirmed"},
+}
+
+
+def parse_xlsx_participants(raw: bytes) -> tuple[list[dict], list[dict], str]:
+    if not raw or len(raw) > 5_000_000:
+        raise ValueError("El Excel está vacío o supera el límite de 5 MB.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            entries = archive.infolist()
+            names = {item.filename for item in entries}
+            if len(entries) > 500 or sum(item.file_size for item in entries) > 25_000_000:
+                raise ValueError("El Excel descomprimido supera los límites permitidos.")
+            if "[Content_Types].xml" not in names or "xl/workbook.xml" not in names:
+                raise ValueError("El archivo no es un libro Excel .xlsx válido.")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("El archivo no es un libro Excel .xlsx válido.") from exc
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("Falta instalar openpyxl desde requirements.txt.") from exc
+
+    try:
+        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError("No se pudo leer el archivo Excel.") from exc
+
+    selected = None
+    try:
+        for sheet in workbook.worksheets:
+            for row_number, row in enumerate(
+                sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 10), values_only=True), start=1
+            ):
+                normalized = {
+                    field_name(str(value)): index
+                    for index, value in enumerate(row)
+                    if value is not None and str(value).strip()
+                }
+                columns = {
+                    canonical: next((normalized[item] for item in aliases if item in normalized), None)
+                    for canonical, aliases in XLSX_ALIASES.items()
+                }
+                if all(columns[item] is not None for item in ("name", "email", "gifts")):
+                    selected = (sheet, row_number, columns)
+                    break
+            if selected:
+                break
+        if not selected:
+            raise ValueError(
+                "No encuentro las columnas obligatorias: Nombre completo, Correo y Regalos."
+            )
+
+        sheet, header_row, columns = selected
+        valid, invalid, seen = [], [], set()
+        max_row = min(sheet.max_row, 10_001)
+        for row_number, row in enumerate(
+            sheet.iter_rows(min_row=header_row + 1, max_row=max_row, values_only=True),
+            start=header_row + 1,
+        ):
+            if not any(value is not None and str(value).strip() for value in row):
+                continue
+
+            def cell(name: str) -> str:
+                index = columns.get(name)
+                if index is None or index >= len(row) or row[index] is None:
+                    return ""
+                return str(row[index]).strip()
+
+            payload = {
+                "name": db.clean_text(cell("name")),
+                "email": db.normalize_email(cell("email")),
+                "gifts": cell("gifts"),
+                "area": db.clean_text(cell("area")),
+            }
+            confirmation = field_name(cell("confirmed")) if columns.get("confirmed") is not None else "si"
+            source = f"{sheet.title}, fila {row_number}"
+            if confirmation not in {"si", "yes", "true", "1", "confirmado", "confirmada", "asistire", "asistira"}:
+                invalid.append({"line": row_number, "email": payload["email"], "error": "Participación no confirmada", "source": source})
+                continue
+            if payload["email"] in seen:
+                invalid.append({"line": row_number, "email": payload["email"], "error": "Correo duplicado en el Excel", "source": source})
+                continue
+            if len(payload["name"]) < 2 or "@" not in payload["email"] or len(payload["gifts"]) < 2:
+                invalid.append({"line": row_number, "email": payload["email"], "error": "Datos incompletos o inválidos", "source": source})
+                continue
+            seen.add(payload["email"])
+            valid.append(payload)
+        if not valid and not invalid:
+            raise ValueError("El Excel no contiene filas de participantes.")
+        return valid, invalid, sheet.title
+    finally:
+        workbook.close()
+
+
 class Application:
     def __init__(
         self,
@@ -179,13 +287,13 @@ class Application:
             return "200 OK", [("Content-Type", "text/javascript; charset=utf-8")], (ROOT / "static/app.js").read_text(encoding="utf-8")
         form = self.read_form(environ) if method == "POST" else {}
         if method == "POST":
+            if form.get("_form_error"):
+                return self.response("413 Payload Too Large", self.page("Archivo rechazado", "<div class='notice error'>El archivo supera el límite permitido.</div>"))
             token = form.get("csrf", "")
             if not hmac.compare_digest(token, session["csrf"]):
                 return self.response("403 Forbidden", self.page("Solicitud rechazada", "<div class='notice error'>Token CSRF inválido.</div>"))
         if path == "/" and method == "GET":
-            return self.response("200 OK", self.public_page(session))
-        if path == "/register" and method == "POST":
-            return self.register(session, form)
+            return self.redirect("/admin")
         if path == "/admin" and method == "GET":
             return self.response("200 OK", self.admin_page(session) if session["admin"] else self.login_page(session))
         if path == "/admin/login" and method == "POST":
@@ -220,9 +328,12 @@ class Application:
 
     def read_form(self, environ) -> dict[str, str]:
         try:
-            length = min(int(environ.get("CONTENT_LENGTH") or 0), 2_100_000)
+            length = int(environ.get("CONTENT_LENGTH") or 0)
         except ValueError:
             length = 0
+        if length > 8_000_000:
+            environ["wsgi.input"].read(min(length, 8_000_000))
+            return {"_form_error": "too_large"}
         raw = environ["wsgi.input"].read(length).decode("utf-8", errors="replace")
         return {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
 
@@ -233,8 +344,8 @@ class Application:
         return "303 See Other", [("Location", location)], ""
 
     def page(self, title: str, content: str, admin: bool = False) -> str:
-        nav = "<a href='/'>Inscripción</a><a href='/admin'>Administración</a>"
-        return f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)} · Amigo secreto</title><link rel="stylesheet" href="/static/style.css"></head><body><header><a class="brand" href="/"><span>AS</span><strong>Amigo secreto</strong></a><nav>{nav}</nav></header><main>{content}</main><footer>Organiza el intercambio sin revelar el secreto.</footer><script src="/static/app.js"></script></body></html>"""
+        nav = "<a href='/admin'>Panel privado</a>"
+        return f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)} · Amigo secreto</title><link rel="stylesheet" href="/static/style.css"></head><body><header><a class="brand" href="/admin"><span>AS</span><strong>Amigo secreto</strong></a><nav>{nav}</nav></header><main>{content}</main><footer>Portal privado de organización del intercambio.</footer><script src="/static/app.js"></script></body></html>"""
 
     def public_page(self, session, message: str = "") -> str:
         with db.connect(self.database_path) as conn:
@@ -271,10 +382,17 @@ class Application:
             statuses = {row["mail_status"]: row["n"] for row in conn.execute("SELECT mail_status,COUNT(*) n FROM assignments WHERE event_id=? GROUP BY mail_status", (self.event_id,))}
             mail_rows = conn.execute("""SELECT a.mail_status,a.attempts,a.technical_error,g.name giver_name,g.email FROM assignments a JOIN participants g ON g.id=a.giver_id WHERE a.event_id=? ORDER BY g.name""", (self.event_id,)).fetchall()
         active = [p for p in participants if p["active"] and p["confirmed"]]
-        alert = f"<div class='notice success'>{html.escape(message)}</div>" if message else ""
+        message_lower = message.casefold()
+        success_prefixes = (
+            "vista previa completa", "sorteo confirmado", "proceso finalizado", "lista cargada",
+            "la conexión ssh fue validada", "el servidor sendmail aceptó",
+        )
+        error_markers = ("error", "falta", "no ", "rechaz", "inválid", "debes", "corrige", "agotó", "deshabilitad", "incierto")
+        alert_class = "error" if any(item in message_lower for item in error_markers) and not message_lower.startswith(success_prefixes) else "success"
+        alert = f"<div class='notice {alert_class}'>{html.escape(message)}</div>" if message else ""
         csrf = session["csrf"]
         test_nonce = session.setdefault("mail_test_nonce", secrets.token_urlsafe(24))
-        status_label = {"open": "Inscripciones abiertas", "preview": "Vista previa lista", "confirmed": "Sorteo confirmado"}[event["status"]]
+        status_label = {"open": "Lista editable", "preview": "Sorteo preparado", "confirmed": "Sorteo confirmado"}[event["status"]]
         participant_rows = "".join(f"""<tr><td><strong>{html.escape(p['name'])}</strong><small>{html.escape(p['area'])}</small></td><td>{html.escape(p['email'])}</td><td class="clip">{html.escape(p['gifts'])}</td><td><span class="pill {'ok' if p['active'] else 'off'}">{'Activo' if p['active'] else 'Excluido'}</span></td><td><form method="post" action="/admin/participant/toggle"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{p['id']}"><button class="text" {'disabled' if event['status'] != 'open' else ''}>Cambiar</button></form></td></tr>""" for p in participants) or "<tr><td colspan='5'>Aún no hay participantes.</td></tr>"
         people_options = "".join(f"<option value='{p['id']}'>{html.escape(p['name'])} — {html.escape(p['email'])}</option>" for p in active)
         restriction_rows = "".join(f"<li>{html.escape(r['giver_name'])} no puede regalar a {html.escape(r['recipient_name'])}<form method='post' action='/admin/restriction/delete'><input type='hidden' name='csrf' value='{csrf}'><input type='hidden' name='id' value='{r['id']}'><button class='text'>Quitar</button></form></li>" for r in restrictions) or "<li class='muted'>Sin bloqueos específicos.</li>"
@@ -315,23 +433,25 @@ class Application:
         if self.mail_test_mode and self.mail_test_recipient:
             test_note += f" Destino actual: {html.escape(self.mail_test_recipient)}."
         mail_config_panel = f"""<section class="card"><p class="eyebrow">Integración SSH / sendmail</p><h2>Validar conexión</h2><p>{mail_state}</p><p>Estado de conexión: <strong>{html.escape(connection_status)}</strong></p><p class="muted">{test_note}</p><div class="actions"><form method="post" action="/admin/mail/connection"><input type="hidden" name="csrf" value="{csrf}"><button {'disabled' if not self.mail_enabled else ''}>Probar conexión SSH</button></form><form method="post" action="/admin/mail/test"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="test_nonce" value="{test_nonce}"><button {'disabled' if not test_enabled else ''}>Enviar correo de prueba</button></form></div></section>"""
-        content = f"""<section class="admin-head"><div><p class="eyebrow">Administración</p><h1>{html.escape(event['name'])}</h1><span class="pill ok">{status_label}</span></div><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{csrf}"><button>Salir</button></form></section>{alert}
-<section class="metrics"><div><strong>{len(active)}</strong><span>participantes activos</span></div><div><strong>0</strong><span>registros incompletos guardados</span></div><div><strong>{sum(statuses.values())}</strong><span>asignaciones confirmadas</span></div><div><strong>{statuses.get('accepted',0)}</strong><span>aceptados por sendmail</span></div></section>
-<details class="card" open><summary>Configuración del evento</summary><form class="form-grid top" method="post" action="/admin/event"><input type="hidden" name="csrf" value="{csrf}"><label>Nombre<input name="name" value="{html.escape(event['name'], quote=True)}" required></label><label>Fecha<input name="event_date" value="{html.escape(event['event_date'], quote=True)}"></label><label>Hora<input name="event_time" value="{html.escape(event['event_time'], quote=True)}"></label><label>Lugar<input name="location" value="{html.escape(event['location'], quote=True)}"></label><label>Presupuesto<input name="budget" value="{html.escape(event['budget'], quote=True)}"></label><label class="full">Instrucciones<textarea name="instructions">{html.escape(event['instructions'])}</textarea></label><label class="checkbox full"><input type="checkbox" name="avoid_same_area" value="1" {'checked' if event['avoid_same_area'] else ''}> Evitar asignaciones dentro de la misma área</label><button {'disabled' if event['status'] != 'open' else ''}>Guardar configuración</button></form></details>
-<section class="two-col"><details class="card" open><summary>Importar CSV</summary><p class="muted">Columnas: nombre, correo, regalos; opcionales: área y confirmado.</p><form method="post" action="/admin/import/preview"><input type="hidden" name="csrf" value="{csrf}"><label>Contenido del CSV<textarea name="csv" rows="7" placeholder="nombre,correo,regalos,area"></textarea></label><input id="csv-file" type="file" accept=".csv,text/csv"><button {'disabled' if event['status'] != 'open' else ''}>Revisar importación</button></form>{self.import_summary(session, csrf)}</details>
-<details class="card" open><summary>Restricciones</summary><form method="post" action="/admin/restriction/add"><input type="hidden" name="csrf" value="{csrf}"><label>Quien regala<select name="giver_id">{people_options}</select></label><label>No puede regalar a<select name="recipient_id">{people_options}</select></label><button {'disabled' if event['status'] != 'open' else ''}>Agregar bloqueo</button></form><ul class="restriction-list">{restriction_rows}</ul></details></section>
-<section class="card"><div class="section-title"><div><p class="eyebrow">Participantes</p><h2>Datos revisables antes del sorteo</h2></div></div><div class="table-wrap"><table><thead><tr><th>Persona</th><th>Correo</th><th>Preferencias</th><th>Estado</th><th></th></tr></thead><tbody>{participant_rows}</tbody></table></div></section>
-<section class="card draw"><p class="eyebrow">Sorteo</p><h2>Generar, validar y confirmar</h2><p>La vista previa comprueba la asignación completa sin revelar públicamente los pares ni enviar correos.</p>{draw_actions}</section>
-{mail_config_panel}
-{f'<section class="card"><p class="eyebrow">Envíos</p><h2>Resultado individual</h2><p class="muted">“Aceptado” significa que sendmail devolvió código 0; no prueba entrega al buzón. Los estados inciertos no se reintentan automáticamente.</p><div class="table-wrap"><table><thead><tr><th>Participante</th><th>Estado</th><th>Intentos</th><th>Error técnico</th></tr></thead><tbody>{mail_status_rows}</tbody></table></div></section>' if mail_rows else ''}"""
+        content = f"""<section class="admin-head"><div><p class="eyebrow">Portal privado</p><h1>{html.escape(event['name'])}</h1><span class="pill ok">{status_label}</span></div><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{csrf}"><button>Salir</button></form></section>{alert}
+<section class="metrics"><div><strong>{len(active)}</strong><span>participantes cargados</span></div><div><strong>{sum(statuses.values())}</strong><span>asignaciones confirmadas</span></div><div><strong>{pending_count}</strong><span>correos pendientes</span></div><div><strong>{statuses.get('accepted',0)}</strong><span>aceptados por sendmail</span></div></section>
+<section class="card step"><p class="eyebrow">Paso 1</p><h2>Cargar participantes desde Excel</h2><p class="muted">El Excel debe incluir Nombre completo, Correo y Regalos. Área o equipo es opcional.</p><form method="post" action="/admin/import/preview" id="xlsx-upload-form"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="xlsx_base64"><input type="hidden" name="filename"><label>Archivo Excel (.xlsx)<input id="xlsx-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></label><button class="primary" {'disabled' if event['status'] != 'open' else ''}>Revisar Excel</button></form>{self.import_summary(session, csrf)}</section>
+<section class="card"><div class="section-title"><div><p class="eyebrow">Lista cargada</p><h2>Participantes que entrarán al sorteo</h2></div></div><div class="table-wrap"><table><thead><tr><th>Persona</th><th>Correo</th><th>Preferencias</th><th>Estado</th><th></th></tr></thead><tbody>{participant_rows}</tbody></table></div></section>
+<details class="card"><summary>Datos del evento</summary><form class="form-grid top" method="post" action="/admin/event"><input type="hidden" name="csrf" value="{csrf}"><label>Nombre<input name="name" value="{html.escape(event['name'], quote=True)}" required></label><label>Fecha<input name="event_date" value="{html.escape(event['event_date'], quote=True)}"></label><label>Hora<input name="event_time" value="{html.escape(event['event_time'], quote=True)}"></label><label>Lugar<input name="location" value="{html.escape(event['location'], quote=True)}"></label><label>Presupuesto<input name="budget" value="{html.escape(event['budget'], quote=True)}"></label><label class="full">Instrucciones<textarea name="instructions">{html.escape(event['instructions'])}</textarea></label><label class="checkbox full"><input type="checkbox" name="avoid_same_area" value="1" {'checked' if event['avoid_same_area'] else ''}> Evitar asignaciones dentro de la misma área</label><button {'disabled' if event['status'] != 'open' else ''}>Guardar datos</button></form></details>
+<details class="card"><summary>Restricciones opcionales</summary><form class="form-grid top" method="post" action="/admin/restriction/add"><input type="hidden" name="csrf" value="{csrf}"><label>Quien regala<select name="giver_id">{people_options}</select></label><label>No puede regalar a<select name="recipient_id">{people_options}</select></label><button {'disabled' if event['status'] != 'open' else ''}>Agregar restricción</button></form><ul class="restriction-list">{restriction_rows}</ul></details>
+<section class="card draw step"><p class="eyebrow">Paso 2</p><h2>Sortear</h2><p>El sistema valida el sorteo completo, pero nunca muestra quién le tocó a quién.</p>{draw_actions}</section>
+<section class="step"><p class="eyebrow">Paso 3</p>{mail_config_panel}</section>
+{f'<section class="card"><p class="eyebrow">Resultado de envíos</p><h2>Estado por participante</h2><p class="muted">La tabla muestra estados, nunca la persona asignada. “Aceptado” significa que sendmail devolvió código 0.</p><div class="table-wrap"><table><thead><tr><th>Participante</th><th>Estado</th><th>Intentos</th><th>Error técnico</th></tr></thead><tbody>{mail_status_rows}</tbody></table></div></section>' if mail_rows else ''}"""
         return self.page("Administración", content, admin=True)
 
     def import_summary(self, session, csrf):
         preview = session.get("import_preview")
         if not preview:
             return ""
-        invalid = "".join(f"<li>Fila {row['line']}: {html.escape(row['email'])} — {html.escape(row['error'])}</li>" for row in preview["invalid"])
-        return f"""<div class="import-result"><strong>{len(preview['valid'])} válidos · {len(preview['invalid'])} inválidos</strong>{f'<ul>{invalid}</ul>' if invalid else ''}<form method="post" action="/admin/import/commit"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="token" value="{preview['token']}"><button class="primary" {'disabled' if not preview['valid'] else ''}>Importar filas válidas</button></form></div>"""
+        invalid = "".join(f"<li>{html.escape(row.get('source') or ('Fila ' + str(row['line'])))}: {html.escape(row['email'])} — {html.escape(row['error'])}</li>" for row in preview["invalid"])
+        can_import = len(preview["valid"]) >= 2 and not preview["invalid"]
+        note = "" if can_import else "<div class='notice warn'>Corrige las filas inválidas. Se necesitan al menos dos participantes válidos.</div>"
+        return f"""<div class="import-result"><p><strong>{html.escape(preview['filename'])}</strong> · Hoja {html.escape(preview['sheet'])}</p><strong>{len(preview['valid'])} válidos · {len(preview['invalid'])} inválidos</strong>{f'<ul>{invalid}</ul>' if invalid else ''}{note}<form method="post" action="/admin/import/commit" data-confirm="La lista actual será reemplazada por este Excel. ¿Continuar?"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="token" value="{preview['token']}"><button class="primary" {'disabled' if not can_import else ''}>Usar esta lista de participantes</button></form></div>"""
 
     @staticmethod
     def mail_status_label(status):
@@ -350,27 +470,43 @@ class Application:
         return self.redirect("/admin")
 
     def import_preview(self, session, form):
-        with db.connect(self.database_path) as conn:
-            existing = {row["email"] for row in conn.execute("SELECT email FROM participants WHERE event_id=?", (self.event_id,))}
+        filename = Path(form.get("filename", "")).name
+        if not filename.casefold().endswith(".xlsx"):
+            return self.response("400 Bad Request", self.admin_page(session, "Selecciona un archivo Excel con extensión .xlsx."))
         try:
-            valid, invalid = parse_csv_participants(form.get("csv", ""), existing)
-        except ValueError as exc:
+            raw = base64.b64decode(form.get("xlsx_base64", ""), validate=True)
+            valid, invalid, sheet = parse_xlsx_participants(raw)
+        except (ValueError, RuntimeError) as exc:
             return self.response("400 Bad Request", self.admin_page(session, str(exc)))
-        session["import_preview"] = {"token": secrets.token_urlsafe(24), "valid": valid, "invalid": invalid}
+        session["import_preview"] = {
+            "token": secrets.token_urlsafe(24),
+            "valid": valid,
+            "invalid": invalid,
+            "filename": filename,
+            "sheet": sheet,
+        }
         return self.redirect("/admin")
 
     def import_commit(self, session, form):
         preview = session.get("import_preview")
         if not preview or not hmac.compare_digest(form.get("token", ""), preview["token"]):
             return self.response("409 Conflict", self.admin_page(session, "La vista previa de importación ya no es válida."))
+        if len(preview["valid"]) < 2 or preview["invalid"]:
+            return self.response("409 Conflict", self.admin_page(session, "Corrige el Excel antes de reemplazar la lista."))
         imported = 0
-        with db.connect(self.database_path) as conn, db.transaction(conn):
-            for item in preview["valid"]:
-                db.add_participant(conn, self.event_id, **item)
-                imported += 1
-            conn.execute("INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)", (self.event_id, "participants_imported", "admin", f"count={imported}", db.now()))
+        with db.connect(self.database_path) as conn:
+            event = conn.execute("SELECT status FROM events WHERE id=?", (self.event_id,)).fetchone()
+            if not event or event["status"] != "open":
+                return self.response("409 Conflict", self.admin_page(session, "No se puede reemplazar la lista después de preparar el sorteo."))
+            with db.transaction(conn):
+                conn.execute("DELETE FROM restrictions WHERE event_id=?", (self.event_id,))
+                conn.execute("DELETE FROM participants WHERE event_id=?", (self.event_id,))
+                for item in preview["valid"]:
+                    db.add_participant(conn, self.event_id, **item)
+                    imported += 1
+                conn.execute("INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)", (self.event_id, "participants_replaced_from_xlsx", "admin", f"count={imported}", db.now()))
         session.pop("import_preview", None)
-        return self.response("200 OK", self.admin_page(session, f"Se importaron {imported} participantes."))
+        return self.response("200 OK", self.admin_page(session, f"Lista cargada: {imported} participantes listos para el sorteo."))
 
     def toggle_participant(self, session, form):
         with db.connect(self.database_path) as conn:
