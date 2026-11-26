@@ -17,6 +17,8 @@ class FakeMailService:
     def __init__(self, statuses=None):
         self.calls = []
         self.statuses = list(statuses or [])
+        self.test_mode = False
+        self.test_recipient = ""
 
     def send(self, message):
         self.calls.append(message)
@@ -24,6 +26,12 @@ class FakeMailService:
         if status == "timeout":
             raise TimeoutError("provider timeout")
         return MailResult(status=status, reference="ref-test", technical_error="mock error" if status == "failed" else "")
+
+    def send_test(self, message):
+        return self.send(message)
+
+    def test_connection(self):
+        return MailResult(status="accepted", reference="ssh-connected")
 
 
 class WsgiClient:
@@ -138,12 +146,17 @@ class WebSecurityAndMailTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def seed_confirmed_draw(self, count=3):
+    def seed_confirmed_draw(self, count=3, test_completed=True):
         with db.connect(self.app.database_path) as conn:
             ids = [db.add_participant(conn, self.app.event_id, name=f"Persona {i}", email=f"person{i}@example.test", gifts=f"Regalo {i}") for i in range(count)]
             assignments = {ids[i]: ids[(i + 1) % count] for i in range(count)}
             db.save_preview(conn, self.app.event_id, assignments, "digest", "test")
             db.confirm_preview(conn, self.app.event_id, "test")
+            if test_completed:
+                conn.execute(
+                    "UPDATE events SET email_test_succeeded_at=? WHERE id=?",
+                    (db.now(), self.app.event_id),
+                )
         return ids
 
     def test_admin_authorization_and_csrf(self):
@@ -161,6 +174,9 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.assertNotIn("test-password", body)
         self.assertNotIn("SECRET_GIFT_MAIL_TOKEN", body)
         self.assertNotIn("SECRET_GIFT_MAIL_URL", body)
+        self.assertNotIn("172.19.30.62", body)
+        self.assertNotIn("usr_mds", body)
+        self.assertNotIn("secret_gift_ssh_password", body)
 
     def test_preview_does_not_send_mail(self):
         with db.connect(self.app.database_path) as conn:
@@ -176,8 +192,9 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.seed_confirmed_draw(3)
         self.client.login()
         csrf = self.client.csrf()
-        first, _, _ = self.client.request("/admin/mail/send", "POST", {"csrf": csrf})
-        second, _, _ = self.client.request("/admin/mail/send", "POST", {"csrf": csrf})
+        data = {"csrf": csrf, "confirmation": "ENVIAR CORREOS"}
+        first, _, _ = self.client.request("/admin/mail/send", "POST", data)
+        second, _, _ = self.client.request("/admin/mail/send", "POST", data)
         self.assertEqual(200, first)
         self.assertEqual(200, second)
         self.assertEqual(3, len(self.mail.calls))
@@ -188,8 +205,9 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.seed_confirmed_draw(3)
         self.client.login()
         csrf = self.client.csrf()
-        self.client.request("/admin/mail/send", "POST", {"csrf": csrf})
-        self.client.request("/admin/mail/retry", "POST", {"csrf": csrf})
+        data = {"csrf": csrf, "confirmation": "ENVIAR CORREOS"}
+        self.client.request("/admin/mail/send", "POST", data)
+        self.client.request("/admin/mail/retry", "POST", data)
         self.assertEqual(4, len(self.mail.calls))
         self.assertEqual(self.mail.calls[1].idempotency_key, self.mail.calls[3].idempotency_key)
 
@@ -198,8 +216,9 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.seed_confirmed_draw(2)
         self.client.login()
         csrf = self.client.csrf()
-        self.client.request("/admin/mail/send", "POST", {"csrf": csrf})
-        self.client.request("/admin/mail/retry", "POST", {"csrf": csrf})
+        data = {"csrf": csrf, "confirmation": "ENVIAR CORREOS"}
+        self.client.request("/admin/mail/send", "POST", data)
+        self.client.request("/admin/mail/retry", "POST", data)
         self.assertEqual(2, len(self.mail.calls))
         with db.connect(self.app.database_path) as conn:
             statuses = {row["mail_status"] for row in conn.execute("SELECT mail_status FROM assignments")}
@@ -211,6 +230,66 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.assertNotIn("<b>HTML</b>", message.html)
         self.assertIn("&lt;script&gt;", message.html)
         self.assertIn("Libro &amp; taza", message.html)
+
+    def test_test_button_is_single_use_and_does_not_expose_recipient(self):
+        app = Application(
+            Path(self.temp.name) / "test-mail.sqlite3",
+            "test-password",
+            mail_service=self.mail,
+            mail_enabled=True,
+            mail_test_recipient="safe@example.test",
+        )
+        client = WsgiClient(app)
+        client.login()
+        status, body, _ = client.request("/admin")
+        self.assertEqual(200, status)
+        self.assertIn("Enviar correo de prueba", body)
+        self.assertIn("Probar conexión SSH", body)
+        self.assertNotIn("safe@example.test", body)
+        sid = client.cookie.split("=", 1)[1]
+        nonce = app.sessions[sid]["mail_test_nonce"]
+        first, _, _ = client.request(
+            "/admin/mail/test", "POST", {"csrf": client.csrf(), "test_nonce": nonce}
+        )
+        second, _, _ = client.request(
+            "/admin/mail/test", "POST", {"csrf": client.csrf(), "test_nonce": nonce}
+        )
+        self.assertEqual(200, first)
+        self.assertEqual(409, second)
+        self.assertEqual(1, len(self.mail.calls))
+
+    def test_real_send_requires_successful_test(self):
+        app = Application(
+            Path(self.temp.name) / "test-mode.sqlite3",
+            "test-password",
+            mail_service=self.mail,
+            mail_enabled=True,
+            mail_test_recipient="safe@example.test",
+            mail_test_mode=False,
+        )
+        client = WsgiClient(app)
+        with db.connect(app.database_path) as conn:
+            ids = [
+                db.add_participant(
+                    conn,
+                    app.event_id,
+                    name=f"Persona {index}",
+                    email=f"mode{index}@example.test",
+                    gifts="Libro",
+                )
+                for index in range(2)
+            ]
+            db.save_preview(conn, app.event_id, {ids[0]: ids[1], ids[1]: ids[0]}, "digest", "test")
+            db.confirm_preview(conn, app.event_id, "test")
+        client.login()
+        status, body, _ = client.request(
+            "/admin/mail/send",
+            "POST",
+            {"csrf": client.csrf(), "confirmation": "ENVIAR CORREOS"},
+        )
+        self.assertEqual(409, status)
+        self.assertIn("correo de prueba", body)
+        self.assertEqual([], self.mail.calls)
 
 
 if __name__ == "__main__":

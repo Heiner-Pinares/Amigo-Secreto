@@ -19,7 +19,13 @@ from wsgiref.simple_server import make_server
 
 from secret_gift import db
 from secret_gift.drawing import DrawError, DrawParticipant, generate_draw
-from secret_gift.mail import DisabledMailService, MailService, render_assignment_mail
+from secret_gift.mail import (
+    DisabledMailService,
+    MailService,
+    SshSendmailService,
+    render_assignment_mail,
+    render_test_mail,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +41,13 @@ def load_local_env(path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "si", "sí", "on"}
 
 
 def field_name(value: str) -> str:
@@ -106,6 +119,10 @@ class Application:
         event_name: str = "Intercambio de Año Nuevo",
         mail_service: MailService | None = None,
         mail_enabled: bool = False,
+        mail_test_recipient: str = "",
+        mail_test_mode: bool = False,
+        mail_config_error: str = "",
+        mail_max_per_run: int = 100,
     ):
         if not admin_password:
             raise RuntimeError("Configura SECRET_GIFT_ADMIN_PASSWORD antes de iniciar.")
@@ -114,6 +131,10 @@ class Application:
         self.admin_password = admin_password
         self.mail_service = mail_service or DisabledMailService()
         self.mail_enabled = mail_enabled
+        self.mail_test_recipient = mail_test_recipient.strip().casefold()
+        self.mail_test_mode = mail_test_mode
+        self.mail_config_error = mail_config_error
+        self.mail_max_per_run = max(1, int(mail_max_per_run))
         self.sessions: dict[str, dict] = {}
         self.send_lock = threading.Lock()
 
@@ -189,6 +210,8 @@ class Application:
                 "/admin/draw/confirm": self.confirm_draw,
                 "/admin/mail/send": self.send_pending,
                 "/admin/mail/retry": self.retry_failed,
+                "/admin/mail/test": self.send_test_mail,
+                "/admin/mail/connection": self.test_mail_connection,
             }
             handler = routes.get(path)
             if handler and method == "POST":
@@ -250,27 +273,57 @@ class Application:
         active = [p for p in participants if p["active"] and p["confirmed"]]
         alert = f"<div class='notice success'>{html.escape(message)}</div>" if message else ""
         csrf = session["csrf"]
+        test_nonce = session.setdefault("mail_test_nonce", secrets.token_urlsafe(24))
         status_label = {"open": "Inscripciones abiertas", "preview": "Vista previa lista", "confirmed": "Sorteo confirmado"}[event["status"]]
         participant_rows = "".join(f"""<tr><td><strong>{html.escape(p['name'])}</strong><small>{html.escape(p['area'])}</small></td><td>{html.escape(p['email'])}</td><td class="clip">{html.escape(p['gifts'])}</td><td><span class="pill {'ok' if p['active'] else 'off'}">{'Activo' if p['active'] else 'Excluido'}</span></td><td><form method="post" action="/admin/participant/toggle"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{p['id']}"><button class="text" {'disabled' if event['status'] != 'open' else ''}>Cambiar</button></form></td></tr>""" for p in participants) or "<tr><td colspan='5'>Aún no hay participantes.</td></tr>"
         people_options = "".join(f"<option value='{p['id']}'>{html.escape(p['name'])} — {html.escape(p['email'])}</option>" for p in active)
         restriction_rows = "".join(f"<li>{html.escape(r['giver_name'])} no puede regalar a {html.escape(r['recipient_name'])}<form method='post' action='/admin/restriction/delete'><input type='hidden' name='csrf' value='{csrf}'><input type='hidden' name='id' value='{r['id']}'><button class='text'>Quitar</button></form></li>" for r in restrictions) or "<li class='muted'>Sin bloqueos específicos.</li>"
         mail_status_rows = "".join(f"<tr><td>{html.escape(r['giver_name'])}<small>{html.escape(r['email'])}</small></td><td><span class='pill {r['mail_status']}'>{self.mail_status_label(r['mail_status'])}</span></td><td>{r['attempts']}</td><td>{html.escape(r['technical_error'][:120])}</td></tr>" for r in mail_rows)
+        assignment_count = sum(statuses.values())
+        pending_count = statuses.get("pending", 0)
+        connection_status = session.get("mail_connection_status", "No probada")
         draw_actions = ""
         if event["status"] == "open":
             draw_actions = f"<form method='post' action='/admin/draw/preview'><input type='hidden' name='csrf' value='{csrf}'><button class='primary'>Generar vista previa del sorteo</button></form>"
         elif event["status"] == "preview":
             draw_actions = f"""<div class="notice warn">La combinación completa fue validada. Todavía no se ha guardado definitivamente ni se han enviado correos.</div><div class="actions"><form method="post" action="/admin/draw/cancel"><input type="hidden" name="csrf" value="{csrf}"><button>Cancelar vista previa</button></form><form method="post" action="/admin/draw/confirm" data-confirm="Confirmar el sorteo es definitivo. ¿Continuar?"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="confirmation" value="CONFIRMAR"><button class="danger">Confirmar sorteo</button></form></div>"""
         else:
-            disabled_note = "" if self.mail_enabled else "<div class='notice warn'>El envío real está deshabilitado hasta configurar el contrato de la función de correo.</div>"
-            draw_actions = f"""{disabled_note}<div class="actions"><form method="post" action="/admin/mail/send" data-confirm="Se enviarán únicamente los correos pendientes. ¿Continuar?"><input type="hidden" name="csrf" value="{csrf}"><button class="primary" {'disabled' if not self.mail_enabled else ''}>Enviar correos pendientes</button></form><form method="post" action="/admin/mail/retry"><input type="hidden" name="csrf" value="{csrf}"><button {'disabled' if not self.mail_enabled else ''}>Reintentar solo fallidos</button></form></div>"""
+            test_completed = bool(event["email_test_succeeded_at"])
+            batch_enabled = self.mail_enabled and test_completed
+            if self.mail_config_error:
+                disabled_note = f"<div class='notice error'>{html.escape(self.mail_config_error)}</div>"
+            elif not self.mail_enabled:
+                disabled_note = "<div class='notice warn'>El envío real está deshabilitado. Completa la configuración privada y reinicia la aplicación.</div>"
+            elif not test_completed:
+                disabled_note = "<div class='notice warn'>Realiza correctamente al menos un correo de prueba antes de procesar la cola.</div>"
+            else:
+                disabled_note = ""
+            mode_notice = (
+                f"<div class='notice warn'><strong>Modo de prueba:</strong> todos los mensajes se sustituirán por {html.escape(self.mail_test_recipient)}.</div>"
+                if self.mail_test_mode
+                else "<div class='notice error'><strong>Modo real activo:</strong> los mensajes se enviarán a los participantes.</div>"
+            )
+            send_summary = f"""<div class="send-summary"><p><strong>{len(active)}</strong> participantes · <strong>{assignment_count}</strong> asignaciones válidas · <strong>{pending_count}</strong> pendientes</p><p>Conexión SSH: <strong>{html.escape(connection_status)}</strong></p>{mode_notice}</div>"""
+            draw_actions = f"""{disabled_note}{send_summary}<div class="actions"><form method="post" action="/admin/mail/send"><input type="hidden" name="csrf" value="{csrf}"><label>Escribe ENVIAR CORREOS para confirmar<input name="confirmation" autocomplete="off" required></label><button class="primary" {'disabled' if not batch_enabled else ''}>Enviar correos pendientes</button></form><form method="post" action="/admin/mail/retry"><input type="hidden" name="csrf" value="{csrf}"><label>Escribe ENVIAR CORREOS para reintentar<input name="confirmation" autocomplete="off" required></label><button {'disabled' if not batch_enabled else ''}>Reintentar solo fallidos</button></form></div>"""
+        test_enabled = self.mail_enabled and bool(self.mail_test_recipient)
+        mail_state = "Configuración válida" if self.mail_enabled else "Envío deshabilitado"
+        if self.mail_config_error:
+            mail_state = html.escape(self.mail_config_error)
+        test_note = "El mensaje de prueba solo se enviará al destinatario configurado."
+        if not self.mail_test_recipient:
+            test_note = "Configura SECRET_GIFT_TEST_RECIPIENT para habilitar la prueba."
+        if self.mail_test_mode and self.mail_test_recipient:
+            test_note += f" Destino actual: {html.escape(self.mail_test_recipient)}."
+        mail_config_panel = f"""<section class="card"><p class="eyebrow">Integración SSH / sendmail</p><h2>Validar conexión</h2><p>{mail_state}</p><p>Estado de conexión: <strong>{html.escape(connection_status)}</strong></p><p class="muted">{test_note}</p><div class="actions"><form method="post" action="/admin/mail/connection"><input type="hidden" name="csrf" value="{csrf}"><button {'disabled' if not self.mail_enabled else ''}>Probar conexión SSH</button></form><form method="post" action="/admin/mail/test"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="test_nonce" value="{test_nonce}"><button {'disabled' if not test_enabled else ''}>Enviar correo de prueba</button></form></div></section>"""
         content = f"""<section class="admin-head"><div><p class="eyebrow">Administración</p><h1>{html.escape(event['name'])}</h1><span class="pill ok">{status_label}</span></div><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{csrf}"><button>Salir</button></form></section>{alert}
-<section class="metrics"><div><strong>{len(active)}</strong><span>participantes activos</span></div><div><strong>0</strong><span>registros incompletos guardados</span></div><div><strong>{sum(statuses.values())}</strong><span>asignaciones confirmadas</span></div><div><strong>{statuses.get('accepted',0)}</strong><span>aceptados por la función</span></div></section>
+<section class="metrics"><div><strong>{len(active)}</strong><span>participantes activos</span></div><div><strong>0</strong><span>registros incompletos guardados</span></div><div><strong>{sum(statuses.values())}</strong><span>asignaciones confirmadas</span></div><div><strong>{statuses.get('accepted',0)}</strong><span>aceptados por sendmail</span></div></section>
 <details class="card" open><summary>Configuración del evento</summary><form class="form-grid top" method="post" action="/admin/event"><input type="hidden" name="csrf" value="{csrf}"><label>Nombre<input name="name" value="{html.escape(event['name'], quote=True)}" required></label><label>Fecha<input name="event_date" value="{html.escape(event['event_date'], quote=True)}"></label><label>Hora<input name="event_time" value="{html.escape(event['event_time'], quote=True)}"></label><label>Lugar<input name="location" value="{html.escape(event['location'], quote=True)}"></label><label>Presupuesto<input name="budget" value="{html.escape(event['budget'], quote=True)}"></label><label class="full">Instrucciones<textarea name="instructions">{html.escape(event['instructions'])}</textarea></label><label class="checkbox full"><input type="checkbox" name="avoid_same_area" value="1" {'checked' if event['avoid_same_area'] else ''}> Evitar asignaciones dentro de la misma área</label><button {'disabled' if event['status'] != 'open' else ''}>Guardar configuración</button></form></details>
 <section class="two-col"><details class="card" open><summary>Importar CSV</summary><p class="muted">Columnas: nombre, correo, regalos; opcionales: área y confirmado.</p><form method="post" action="/admin/import/preview"><input type="hidden" name="csrf" value="{csrf}"><label>Contenido del CSV<textarea name="csv" rows="7" placeholder="nombre,correo,regalos,area"></textarea></label><input id="csv-file" type="file" accept=".csv,text/csv"><button {'disabled' if event['status'] != 'open' else ''}>Revisar importación</button></form>{self.import_summary(session, csrf)}</details>
 <details class="card" open><summary>Restricciones</summary><form method="post" action="/admin/restriction/add"><input type="hidden" name="csrf" value="{csrf}"><label>Quien regala<select name="giver_id">{people_options}</select></label><label>No puede regalar a<select name="recipient_id">{people_options}</select></label><button {'disabled' if event['status'] != 'open' else ''}>Agregar bloqueo</button></form><ul class="restriction-list">{restriction_rows}</ul></details></section>
 <section class="card"><div class="section-title"><div><p class="eyebrow">Participantes</p><h2>Datos revisables antes del sorteo</h2></div></div><div class="table-wrap"><table><thead><tr><th>Persona</th><th>Correo</th><th>Preferencias</th><th>Estado</th><th></th></tr></thead><tbody>{participant_rows}</tbody></table></div></section>
 <section class="card draw"><p class="eyebrow">Sorteo</p><h2>Generar, validar y confirmar</h2><p>La vista previa comprueba la asignación completa sin revelar públicamente los pares ni enviar correos.</p>{draw_actions}</section>
-{f'<section class="card"><p class="eyebrow">Envíos</p><h2>Resultado individual</h2><p class="muted">“Enviado” significa aceptado por la función; no prueba entrega al buzón. Los estados inciertos no se reintentan automáticamente.</p><div class="table-wrap"><table><thead><tr><th>Participante</th><th>Estado</th><th>Intentos</th><th>Error técnico</th></tr></thead><tbody>{mail_status_rows}</tbody></table></div></section>' if mail_rows else ''}"""
+{mail_config_panel}
+{f'<section class="card"><p class="eyebrow">Envíos</p><h2>Resultado individual</h2><p class="muted">“Aceptado” significa que sendmail devolvió código 0; no prueba entrega al buzón. Los estados inciertos no se reintentan automáticamente.</p><div class="table-wrap"><table><thead><tr><th>Participante</th><th>Estado</th><th>Intentos</th><th>Error técnico</th></tr></thead><tbody>{mail_status_rows}</tbody></table></div></section>' if mail_rows else ''}"""
         return self.page("Administración", content, admin=True)
 
     def import_summary(self, session, csrf):
@@ -282,7 +335,7 @@ class Application:
 
     @staticmethod
     def mail_status_label(status):
-        return {"pending": "Pendiente", "sending": "En proceso", "accepted": "Enviado / aceptado", "failed": "Error", "unknown": "Estado incierto"}.get(status, status)
+        return {"pending": "Pendiente", "sending": "Procesando", "accepted": "Aceptado por servidor", "failed": "Fallido", "unknown": "Incierto"}.get(status, status)
 
     def logout(self, session, form):
         session.clear(); session.update(csrf=secrets.token_urlsafe(32), admin=False, seen=time.time())
@@ -370,14 +423,101 @@ class Application:
         return self.response("200 OK", self.admin_page(session, "Sorteo confirmado y guardado definitivamente. Aún no se enviaron correos."))
 
     def send_pending(self, session, form):
-        return self.process_mail(session, retry_failed=False)
+        return self.process_mail(session, form, retry_failed=False)
 
     def retry_failed(self, session, form):
-        return self.process_mail(session, retry_failed=True)
+        return self.process_mail(session, form, retry_failed=True)
 
-    def process_mail(self, session, retry_failed: bool):
+    def test_mail_connection(self, session, form):
+        if not self.mail_enabled:
+            return self.response("503 Service Unavailable", self.admin_page(session, "La integración SSH está deshabilitada o incompleta."))
+        if not self.send_lock.acquire(blocking=False):
+            return self.response("409 Conflict", self.admin_page(session, "Ya hay una operación de correo en curso."))
+        try:
+            result = self.mail_service.test_connection()
+            if result.status == "accepted":
+                session["mail_connection_status"] = "Exitosa"
+                message = "La conexión SSH fue validada correctamente. Todavía no se envió ningún correo."
+                status = "200 OK"
+            else:
+                session["mail_connection_status"] = "Error"
+                message = result.technical_error or "No fue posible validar la conexión SSH."
+                status = "502 Bad Gateway"
+            with db.connect(self.database_path) as conn:
+                conn.execute(
+                    "INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)",
+                    (
+                        self.event_id,
+                        "ssh_connection_test",
+                        "admin",
+                        f"duration_ms={result.duration_ms};status={result.status};error_type={result.error_type}",
+                        db.now(),
+                    ),
+                )
+            return self.response(status, self.admin_page(session, message))
+        finally:
+            self.send_lock.release()
+
+    def send_test_mail(self, session, form):
+        if not self.mail_enabled:
+            return self.response("503 Service Unavailable", self.admin_page(session, "El envío está deshabilitado o su configuración no es válida."))
+        if not self.mail_test_recipient:
+            return self.response("409 Conflict", self.admin_page(session, "No hay un destinatario de prueba configurado."))
+        expected_nonce = session.get("mail_test_nonce", "")
+        submitted_nonce = form.get("test_nonce", "")
+        if not expected_nonce or not hmac.compare_digest(expected_nonce, submitted_nonce):
+            return self.response("409 Conflict", self.admin_page(session, "Esta solicitud de prueba ya fue utilizada o expiró."))
+        session["mail_test_nonce"] = secrets.token_urlsafe(24)
+        if not self.send_lock.acquire(blocking=False):
+            return self.response("409 Conflict", self.admin_page(session, "Ya hay un envío en curso."))
+        try:
+            with db.connect(self.database_path) as conn:
+                event = conn.execute("SELECT name FROM events WHERE id=?", (self.event_id,)).fetchone()
+            message = render_test_mail(
+                event_name=event["name"],
+                idempotency_key=f"test:{self.event_id}:{submitted_nonce}",
+            )
+            sender = getattr(self.mail_service, "send_test", None)
+            result = None
+            if sender is None:
+                result_status, result_error = "failed", "El adaptador no admite el modo de prueba."
+            else:
+                try:
+                    result = sender(message)
+                    result_status = result.status if result.status in {"accepted", "failed", "unknown"} else "unknown"
+                    result_error = result.technical_error[:500]
+                except Exception:
+                    result_status, result_error = "failed", "Ocurrió un fallo interno en el adaptador de correo."
+            with db.connect(self.database_path) as conn:
+                conn.execute(
+                    "INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)",
+                    (
+                        self.event_id,
+                        "test_mail_attempt",
+                        "admin",
+                        f"duration_ms={getattr(result, 'duration_ms', 0)};exit_code={getattr(result, 'exit_code', None)};status={result_status};error_type={getattr(result, 'error_type', 'adapter_error')}",
+                        db.now(),
+                    ),
+                )
+            if result_status == "accepted":
+                session["mail_connection_status"] = "Exitosa; sendmail aceptó la prueba"
+                with db.connect(self.database_path) as conn:
+                    conn.execute(
+                        "UPDATE events SET email_test_succeeded_at=? WHERE id=?",
+                        (db.now(), self.event_id),
+                    )
+                return self.response("200 OK", self.admin_page(session, "El servidor sendmail aceptó el correo de prueba."))
+            if result_status == "unknown":
+                return self.response("202 Accepted", self.admin_page(session, "El resultado del correo de prueba es incierto. No lo reenvíes automáticamente."))
+            return self.response("502 Bad Gateway", self.admin_page(session, result_error or "El servidor rechazó el correo de prueba."))
+        finally:
+            self.send_lock.release()
+
+    def process_mail(self, session, form, retry_failed: bool):
         if not self.mail_enabled:
             return self.response("503 Service Unavailable", self.admin_page(session, "El envío está deshabilitado."))
+        if form.get("confirmation", "").strip() != "ENVIAR CORREOS":
+            return self.response("400 Bad Request", self.admin_page(session, "Escribe exactamente ENVIAR CORREOS para confirmar."))
         if not self.send_lock.acquire(blocking=False):
             return self.response("409 Conflict", self.admin_page(session, "Ya hay un envío en curso."))
         try:
@@ -386,13 +526,16 @@ class Application:
                 event = conn.execute("SELECT * FROM events WHERE id=? AND status='confirmed'", (self.event_id,)).fetchone()
                 if not event:
                     return self.response("409 Conflict", self.admin_page(session, "Confirma el sorteo antes de enviar."))
-                rows = conn.execute("""SELECT a.*,g.name giver_name,g.email,r.name recipient_name,r.gifts recipient_gifts FROM assignments a JOIN participants g ON g.id=a.giver_id JOIN participants r ON r.id=a.recipient_id WHERE a.event_id=? AND a.mail_status=? ORDER BY g.name""", (self.event_id, target)).fetchall()
+                if not event["email_test_succeeded_at"]:
+                    return self.response("409 Conflict", self.admin_page(session, "Debes completar correctamente un correo de prueba antes de procesar la cola."))
+                rows = conn.execute("""SELECT a.*,g.name giver_name,g.email,r.name recipient_name,r.gifts recipient_gifts FROM assignments a JOIN participants g ON g.id=a.giver_id JOIN participants r ON r.id=a.recipient_id WHERE a.event_id=? AND a.mail_status=? ORDER BY g.name LIMIT ?""", (self.event_id, target, self.mail_max_per_run)).fetchall()
                 assignment_ids = [row["id"] for row in rows]
                 with db.transaction(conn):
                     for assignment_id in assignment_ids:
                         conn.execute("UPDATE assignments SET mail_status='sending',attempts=attempts+1,last_attempt_at=?,technical_error='' WHERE id=? AND mail_status=?", (db.now(), assignment_id, target))
             for row in rows:
                 message = render_assignment_mail(giver_name=row["giver_name"], recipient_name=row["recipient_name"], recipient_gifts=row["recipient_gifts"], event_name=event["name"], instructions=event["instructions"], event_date=event["event_date"], event_time=event["event_time"], location=event["location"], budget=event["budget"], idempotency_key=row["idempotency_key"], to=row["email"])
+                result = None
                 try:
                     result = self.mail_service.send(message)
                     status = result.status if result.status in {"accepted", "failed", "unknown"} else "unknown"
@@ -400,11 +543,23 @@ class Application:
                     reference = result.reference[:200]
                 except TimeoutError:
                     status, error, reference = "unknown", "Timeout: resultado incierto; requiere revisión manual.", ""
-                except Exception as exc:
-                    status, error, reference = "failed", f"{type(exc).__name__}: {str(exc)[:400]}", ""
+                except Exception:
+                    status, error, reference = "failed", "Ocurrió un fallo interno en el adaptador de correo.", ""
                 with db.connect(self.database_path) as conn:
                     conn.execute("UPDATE assignments SET mail_status=?,provider_reference=?,technical_error=? WHERE id=? AND mail_status='sending'", (status, reference, error, row["id"]))
-                    conn.execute("INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)", (self.event_id, "mail_attempt", "admin", f"assignment={row['id']};status={status}", db.now()))
+                    result_exit_code = getattr(result, "exit_code", None)
+                    result_duration = getattr(result, "duration_ms", 0)
+                    result_error_type = getattr(result, "error_type", "adapter_error")
+                    conn.execute(
+                        "INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)",
+                        (
+                            self.event_id,
+                            "mail_attempt",
+                            "admin",
+                            f"participant={row['giver_id']};duration_ms={result_duration};exit_code={result_exit_code};status={status};error_type={result_error_type}",
+                            db.now(),
+                        ),
+                    )
             return self.response("200 OK", self.admin_page(session, f"Proceso finalizado: {len(rows)} correo(s) procesado(s)."))
         finally:
             self.send_lock.release()
@@ -415,11 +570,48 @@ def main() -> None:
     password = os.getenv("SECRET_GIFT_ADMIN_PASSWORD", "")
     database_setting = Path(os.getenv("SECRET_GIFT_DB", "data/secret_gift.sqlite3"))
     database_path = database_setting if database_setting.is_absolute() else ROOT / database_setting
+    mail_enabled_requested = env_flag("SECRET_GIFT_EMAIL_ENABLED")
+    mail_test_mode = env_flag("SECRET_GIFT_TEST_MODE", default=True)
+    mail_test_recipient = os.getenv("SECRET_GIFT_TEST_RECIPIENT", "").strip()
+    password_file_setting = Path(os.getenv("SECRET_GIFT_SSH_PASSWORD_FILE", "secrets/secret_gift_ssh_password.txt"))
+    password_file = password_file_setting if password_file_setting.is_absolute() else ROOT / password_file_setting
+    known_hosts_setting = Path(os.getenv("SECRET_GIFT_SSH_KNOWN_HOSTS", "secrets/secret_gift_known_hosts"))
+    known_hosts_file = known_hosts_setting if known_hosts_setting.is_absolute() else ROOT / known_hosts_setting
+    mail_service: MailService = DisabledMailService()
+    mail_enabled = False
+    mail_config_error = ""
+    if mail_enabled_requested:
+        try:
+            mail_service = SshSendmailService(
+                host=os.getenv("SECRET_GIFT_SSH_HOST", "172.19.30.62"),
+                port=os.getenv("SECRET_GIFT_SSH_PORT", "22"),
+                username=os.getenv("SECRET_GIFT_SSH_USER", "usr_mds"),
+                password_file=password_file,
+                known_hosts_file=known_hosts_file,
+                from_address=os.getenv("SECRET_GIFT_EMAIL_FROM", ""),
+                from_name=os.getenv("SECRET_GIFT_EMAIL_FROM_NAME", "Amigo secreto de Año Nuevo"),
+                timeout=os.getenv("SECRET_GIFT_EMAIL_TIMEOUT", "30"),
+                test_mode=mail_test_mode,
+                test_recipient=mail_test_recipient,
+            )
+            mail_service.validate_configuration()
+            mail_enabled = True
+        except (ValueError, RuntimeError) as exc:
+            mail_config_error = str(exc)
+    try:
+        mail_max_per_run = int(os.getenv("SECRET_GIFT_EMAIL_MAX_PER_RUN", "100"))
+    except ValueError:
+        mail_max_per_run = 100
     app = Application(
         database_path,
         password,
         event_name=os.getenv("SECRET_GIFT_EVENT_NAME", "Intercambio de Año Nuevo"),
-        mail_enabled=False,
+        mail_service=mail_service,
+        mail_enabled=mail_enabled,
+        mail_test_recipient=mail_test_recipient,
+        mail_test_mode=mail_test_mode,
+        mail_config_error=mail_config_error,
+        mail_max_per_run=mail_max_per_run,
     )
     initial_values = {
         "event_date": os.getenv("SECRET_GIFT_EVENT_DATE", ""),

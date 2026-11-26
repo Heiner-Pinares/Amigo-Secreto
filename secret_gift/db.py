@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS events (
   preview_hash TEXT,
   draw_id TEXT,
   confirmed_at TEXT,
+  email_test_succeeded_at TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS participants (
@@ -102,6 +103,9 @@ def initialize(path: str | Path, event_name: str) -> str:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+        if "email_test_succeeded_at" not in event_columns:
+            conn.execute("ALTER TABLE events ADD COLUMN email_test_succeeded_at TEXT")
         row = conn.execute("SELECT id FROM events ORDER BY created_at LIMIT 1").fetchone()
         if row:
             return row["id"]
@@ -185,7 +189,7 @@ def confirm_preview(conn, event_id: str, actor: str, fail_after: int | None = No
                 raise RuntimeError("Fallo de prueba durante la confirmación")
             conn.execute(
                 "INSERT INTO assignments(id,event_id,draw_id,giver_id,recipient_id,idempotency_key) VALUES(?,?,?,?,?,?)",
-                (str(uuid.uuid4()), event_id, draw_id, giver_id, recipient_id, f"{draw_id}:{giver_id}"),
+                (str(uuid.uuid4()), event_id, draw_id, giver_id, recipient_id, f"{event_id}:{draw_id}:{giver_id}"),
             )
         conn.execute(
             "UPDATE events SET status='confirmed',draw_id=?,confirmed_at=?,preview_json=NULL,preview_hash=NULL WHERE id=?",
