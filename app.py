@@ -307,12 +307,12 @@ class Application:
                 return self.response("401 Unauthorized", self.login_page(session, "Inicia sesión para continuar."))
             routes = {
                 "/admin/logout": self.logout,
-                "/admin/event": self.update_event,
                 "/admin/import/preview": self.import_preview,
                 "/admin/import/commit": self.import_commit,
-                "/admin/participant/toggle": self.toggle_participant,
+                "/admin/participant/delete": self.delete_participant,
                 "/admin/restriction/add": self.add_restriction,
                 "/admin/restriction/delete": self.delete_restriction,
+                "/admin/restriction/settings": self.update_restriction_settings,
                 "/admin/draw/preview": self.draw_preview,
                 "/admin/draw/cancel": self.cancel_preview,
                 "/admin/draw/confirm": self.confirm_draw,
@@ -393,7 +393,7 @@ class Application:
         csrf = session["csrf"]
         test_nonce = session.setdefault("mail_test_nonce", secrets.token_urlsafe(24))
         status_label = {"open": "Lista editable", "preview": "Sorteo preparado", "confirmed": "Sorteo confirmado"}[event["status"]]
-        participant_rows = "".join(f"""<tr><td><strong>{html.escape(p['name'])}</strong><small>{html.escape(p['area'])}</small></td><td>{html.escape(p['email'])}</td><td class="clip">{html.escape(p['gifts'])}</td><td><span class="pill {'ok' if p['active'] else 'off'}">{'Activo' if p['active'] else 'Excluido'}</span></td><td><form method="post" action="/admin/participant/toggle"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{p['id']}"><button class="text" {'disabled' if event['status'] != 'open' else ''}>Cambiar</button></form></td></tr>""" for p in participants) or "<tr><td colspan='5'>Aún no hay participantes.</td></tr>"
+        participant_rows = "".join(f"""<tr><td><strong>{html.escape(p['name'])}</strong><small>{html.escape(p['area'])}</small></td><td>{html.escape(p['email'])}</td><td class="clip">{html.escape(p['gifts'])}</td><td><span class="pill ok">Activo</span></td><td><form method="post" action="/admin/participant/delete" data-confirm="¿Eliminar a {html.escape(p['name'], quote=True)} de la lista?"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{p['id']}"><button class="text delete" {'disabled' if event['status'] != 'open' else ''}>Eliminar</button></form></td></tr>""" for p in participants) or "<tr><td colspan='5'>Aún no hay participantes.</td></tr>"
         people_options = "".join(f"<option value='{p['id']}'>{html.escape(p['name'])} — {html.escape(p['email'])}</option>" for p in active)
         restriction_rows = "".join(f"<li>{html.escape(r['giver_name'])} no puede regalar a {html.escape(r['recipient_name'])}<form method='post' action='/admin/restriction/delete'><input type='hidden' name='csrf' value='{csrf}'><input type='hidden' name='id' value='{r['id']}'><button class='text'>Quitar</button></form></li>" for r in restrictions) or "<li class='muted'>Sin bloqueos específicos.</li>"
         mail_status_rows = "".join(f"<tr><td>{html.escape(r['giver_name'])}<small>{html.escape(r['email'])}</small></td><td><span class='pill {r['mail_status']}'>{self.mail_status_label(r['mail_status'])}</span></td><td>{r['attempts']}</td><td>{html.escape(r['technical_error'][:120])}</td></tr>" for r in mail_rows)
@@ -437,8 +437,7 @@ class Application:
 <section class="metrics"><div><strong>{len(active)}</strong><span>participantes cargados</span></div><div><strong>{sum(statuses.values())}</strong><span>asignaciones confirmadas</span></div><div><strong>{pending_count}</strong><span>correos pendientes</span></div><div><strong>{statuses.get('accepted',0)}</strong><span>aceptados por sendmail</span></div></section>
 <section class="card step"><p class="eyebrow">Paso 1</p><h2>Cargar participantes desde Excel</h2><p class="muted">El Excel debe incluir Nombre completo, Correo y Regalos. Área o equipo es opcional.</p><form method="post" action="/admin/import/preview" id="xlsx-upload-form"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="xlsx_base64"><input type="hidden" name="filename"><label>Archivo Excel (.xlsx)<input id="xlsx-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></label><button class="primary" {'disabled' if event['status'] != 'open' else ''}>Revisar Excel</button></form>{self.import_summary(session, csrf)}</section>
 <section class="card"><div class="section-title"><div><p class="eyebrow">Lista cargada</p><h2>Participantes que entrarán al sorteo</h2></div></div><div class="table-wrap"><table><thead><tr><th>Persona</th><th>Correo</th><th>Preferencias</th><th>Estado</th><th></th></tr></thead><tbody>{participant_rows}</tbody></table></div></section>
-<details class="card"><summary>Datos del evento</summary><form class="form-grid top" method="post" action="/admin/event"><input type="hidden" name="csrf" value="{csrf}"><label>Nombre<input name="name" value="{html.escape(event['name'], quote=True)}" required></label><label>Fecha<input name="event_date" value="{html.escape(event['event_date'], quote=True)}"></label><label>Hora<input name="event_time" value="{html.escape(event['event_time'], quote=True)}"></label><label>Lugar<input name="location" value="{html.escape(event['location'], quote=True)}"></label><label>Presupuesto<input name="budget" value="{html.escape(event['budget'], quote=True)}"></label><label class="full">Instrucciones<textarea name="instructions">{html.escape(event['instructions'])}</textarea></label><label class="checkbox full"><input type="checkbox" name="avoid_same_area" value="1" {'checked' if event['avoid_same_area'] else ''}> Evitar asignaciones dentro de la misma área</label><button {'disabled' if event['status'] != 'open' else ''}>Guardar datos</button></form></details>
-<details class="card"><summary>Restricciones opcionales</summary><form class="form-grid top" method="post" action="/admin/restriction/add"><input type="hidden" name="csrf" value="{csrf}"><label>Quien regala<select name="giver_id">{people_options}</select></label><label>No puede regalar a<select name="recipient_id">{people_options}</select></label><button {'disabled' if event['status'] != 'open' else ''}>Agregar restricción</button></form><ul class="restriction-list">{restriction_rows}</ul></details>
+<details class="card"><summary>Restricciones opcionales</summary><form class="top" method="post" action="/admin/restriction/settings"><input type="hidden" name="csrf" value="{csrf}"><label class="checkbox"><input type="checkbox" name="avoid_same_area" value="1" {'checked' if event['avoid_same_area'] else ''}> Evitar asignaciones dentro de la misma área</label><button {'disabled' if event['status'] != 'open' else ''}>Guardar regla</button></form><form class="form-grid top" method="post" action="/admin/restriction/add"><input type="hidden" name="csrf" value="{csrf}"><label>Quien regala<select name="giver_id">{people_options}</select></label><label>No puede regalar a<select name="recipient_id">{people_options}</select></label><button {'disabled' if event['status'] != 'open' else ''}>Agregar restricción</button></form><ul class="restriction-list">{restriction_rows}</ul></details>
 <section class="card draw step"><p class="eyebrow">Paso 2</p><h2>Sortear</h2><p>El sistema valida el sorteo completo, pero nunca muestra quién le tocó a quién.</p>{draw_actions}</section>
 <section class="step"><p class="eyebrow">Paso 3</p>{mail_config_panel}</section>
 {f'<section class="card"><p class="eyebrow">Resultado de envíos</p><h2>Estado por participante</h2><p class="muted">La tabla muestra estados, nunca la persona asignada. “Aceptado” significa que sendmail devolvió código 0.</p><div class="table-wrap"><table><thead><tr><th>Participante</th><th>Estado</th><th>Intentos</th><th>Error técnico</th></tr></thead><tbody>{mail_status_rows}</tbody></table></div></section>' if mail_rows else ''}"""
@@ -508,9 +507,31 @@ class Application:
         session.pop("import_preview", None)
         return self.response("200 OK", self.admin_page(session, f"Lista cargada: {imported} participantes listos para el sorteo."))
 
-    def toggle_participant(self, session, form):
+    def delete_participant(self, session, form):
+        participant_id = form.get("id", "")
+        with db.connect(self.database_path) as conn, db.transaction(conn):
+            event = conn.execute("SELECT status FROM events WHERE id=?", (self.event_id,)).fetchone()
+            if not event or event["status"] != "open":
+                return self.response("409 Conflict", self.admin_page(session, "No se pueden eliminar participantes después de preparar el sorteo."))
+            participant = conn.execute(
+                "SELECT id FROM participants WHERE id=? AND event_id=?",
+                (participant_id, self.event_id),
+            ).fetchone()
+            if not participant:
+                return self.response("404 Not Found", self.admin_page(session, "El participante ya no existe."))
+            conn.execute("DELETE FROM participants WHERE id=? AND event_id=?", (participant_id, self.event_id))
+            conn.execute(
+                "INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)",
+                (self.event_id, "participant_deleted", "admin", f"participant={participant_id}", db.now()),
+            )
+        return self.response("200 OK", self.admin_page(session, "Participante eliminado de la lista."))
+
+    def update_restriction_settings(self, session, form):
         with db.connect(self.database_path) as conn:
-            conn.execute("UPDATE participants SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=? AND event_id=? AND (SELECT status FROM events WHERE id=?)='open'", (form.get("id", ""), self.event_id, self.event_id))
+            conn.execute(
+                "UPDATE events SET avoid_same_area=? WHERE id=? AND status='open'",
+                (1 if form.get("avoid_same_area") == "1" else 0, self.event_id),
+            )
         return self.redirect("/admin")
 
     def add_restriction(self, session, form):

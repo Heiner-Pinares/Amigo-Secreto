@@ -229,6 +229,53 @@ class WebSecurityAndMailTests(unittest.TestCase):
         self.assertEqual(404, status)
         self.assertNotIn("Confirmar inscripción", body)
 
+    def test_admin_can_delete_participant_before_draw(self):
+        with db.connect(self.app.database_path) as conn:
+            participant_id = db.add_participant(
+                conn,
+                self.app.event_id,
+                name="Persona a eliminar",
+                email="delete@example.test",
+                gifts="Libro",
+            )
+        self.client.login()
+        status, body, _ = self.client.request("/admin")
+        self.assertEqual(200, status)
+        self.assertIn("Eliminar", body)
+        self.assertNotIn("Datos del evento", body)
+        status, body, _ = self.client.request(
+            "/admin/participant/delete",
+            "POST",
+            {"csrf": self.client.csrf(), "id": participant_id},
+        )
+        self.assertEqual(200, status)
+        self.assertIn("Participante eliminado", body)
+        with db.connect(self.app.database_path) as conn:
+            count = conn.execute("SELECT COUNT(*) AS n FROM participants").fetchone()["n"]
+        self.assertEqual(0, count)
+
+    def test_participant_cannot_be_deleted_after_draw_preview(self):
+        with db.connect(self.app.database_path) as conn:
+            ids = [
+                db.add_participant(
+                    conn,
+                    self.app.event_id,
+                    name=f"Persona {index}",
+                    email=f"locked{index}@example.test",
+                    gifts="Libro",
+                )
+                for index in range(2)
+            ]
+            db.save_preview(conn, self.app.event_id, {ids[0]: ids[1], ids[1]: ids[0]}, "digest", "test")
+        self.client.login()
+        status, body, _ = self.client.request(
+            "/admin/participant/delete",
+            "POST",
+            {"csrf": self.client.csrf(), "id": ids[0]},
+        )
+        self.assertEqual(409, status)
+        self.assertIn("No se pueden eliminar", body)
+
     def test_excel_upload_replaces_existing_list(self):
         with db.connect(self.app.database_path) as conn:
             db.add_participant(
