@@ -254,7 +254,7 @@ class WebSecurityAndMailTests(unittest.TestCase):
             count = conn.execute("SELECT COUNT(*) AS n FROM participants").fetchone()["n"]
         self.assertEqual(0, count)
 
-    def test_participant_cannot_be_deleted_after_draw_preview(self):
+    def test_deleting_participant_cancels_draw_preview(self):
         with db.connect(self.app.database_path) as conn:
             ids = [
                 db.add_participant(
@@ -273,8 +273,14 @@ class WebSecurityAndMailTests(unittest.TestCase):
             "POST",
             {"csrf": self.client.csrf(), "id": ids[0]},
         )
-        self.assertEqual(409, status)
-        self.assertIn("No se pueden eliminar", body)
+        self.assertEqual(200, status)
+        self.assertIn("La vista previa se canceló", body)
+        with db.connect(self.app.database_path) as conn:
+            event = conn.execute("SELECT status,preview_json FROM events WHERE id=?", (self.app.event_id,)).fetchone()
+            remaining = conn.execute("SELECT COUNT(*) AS n FROM participants").fetchone()["n"]
+        self.assertEqual("open", event["status"])
+        self.assertIsNone(event["preview_json"])
+        self.assertEqual(1, remaining)
 
     def test_excel_upload_replaces_existing_list(self):
         with db.connect(self.app.database_path) as conn:

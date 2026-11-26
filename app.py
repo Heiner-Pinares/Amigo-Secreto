@@ -393,7 +393,7 @@ class Application:
         csrf = session["csrf"]
         test_nonce = session.setdefault("mail_test_nonce", secrets.token_urlsafe(24))
         status_label = {"open": "Lista editable", "preview": "Sorteo preparado", "confirmed": "Sorteo confirmado"}[event["status"]]
-        participant_rows = "".join(f"""<tr><td><strong>{html.escape(p['name'])}</strong><small>{html.escape(p['area'])}</small></td><td>{html.escape(p['email'])}</td><td class="clip">{html.escape(p['gifts'])}</td><td><span class="pill ok">Activo</span></td><td><form method="post" action="/admin/participant/delete" data-confirm="¿Eliminar a {html.escape(p['name'], quote=True)} de la lista?"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{p['id']}"><button class="text delete" {'disabled' if event['status'] != 'open' else ''}>Eliminar</button></form></td></tr>""" for p in participants) or "<tr><td colspan='5'>Aún no hay participantes.</td></tr>"
+        participant_rows = "".join(f"""<tr><td><strong>{html.escape(p['name'])}</strong><small>{html.escape(p['area'])}</small></td><td>{html.escape(p['email'])}</td><td class="clip">{html.escape(p['gifts'])}</td><td><span class="pill ok">Activo</span></td><td><form method="post" action="/admin/participant/delete" data-confirm="¿Eliminar a {html.escape(p['name'], quote=True)} de la lista?{' La vista previa del sorteo se cancelará.' if event['status'] == 'preview' else ''}"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{p['id']}"><button class="text delete" {'disabled title="No se puede eliminar después de confirmar el sorteo"' if event['status'] == 'confirmed' else ''}>Eliminar</button></form></td></tr>""" for p in participants) or "<tr><td colspan='5'>Aún no hay participantes.</td></tr>"
         people_options = "".join(f"<option value='{p['id']}'>{html.escape(p['name'])} — {html.escape(p['email'])}</option>" for p in active)
         restriction_rows = "".join(f"<li>{html.escape(r['giver_name'])} no puede regalar a {html.escape(r['recipient_name'])}<form method='post' action='/admin/restriction/delete'><input type='hidden' name='csrf' value='{csrf}'><input type='hidden' name='id' value='{r['id']}'><button class='text'>Quitar</button></form></li>" for r in restrictions) or "<li class='muted'>Sin bloqueos específicos.</li>"
         mail_status_rows = "".join(f"<tr><td>{html.escape(r['giver_name'])}<small>{html.escape(r['email'])}</small></td><td><span class='pill {r['mail_status']}'>{self.mail_status_label(r['mail_status'])}</span></td><td>{r['attempts']}</td><td>{html.escape(r['technical_error'][:120])}</td></tr>" for r in mail_rows)
@@ -511,20 +511,31 @@ class Application:
         participant_id = form.get("id", "")
         with db.connect(self.database_path) as conn, db.transaction(conn):
             event = conn.execute("SELECT status FROM events WHERE id=?", (self.event_id,)).fetchone()
-            if not event or event["status"] != "open":
-                return self.response("409 Conflict", self.admin_page(session, "No se pueden eliminar participantes después de preparar el sorteo."))
+            if not event or event["status"] == "confirmed":
+                return self.response("409 Conflict", self.admin_page(session, "No se pueden eliminar participantes después de confirmar definitivamente el sorteo."))
             participant = conn.execute(
                 "SELECT id FROM participants WHERE id=? AND event_id=?",
                 (participant_id, self.event_id),
             ).fetchone()
             if not participant:
                 return self.response("404 Not Found", self.admin_page(session, "El participante ya no existe."))
+            preview_cancelled = event["status"] == "preview"
+            if preview_cancelled:
+                conn.execute(
+                    "UPDATE events SET status='open',preview_json=NULL,preview_hash=NULL WHERE id=?",
+                    (self.event_id,),
+                )
+                conn.execute(
+                    "INSERT INTO audit_log(event_id,action,actor,created_at) VALUES(?,?,?,?)",
+                    (self.event_id, "draw_preview_cancelled_for_participant_delete", "admin", db.now()),
+                )
             conn.execute("DELETE FROM participants WHERE id=? AND event_id=?", (participant_id, self.event_id))
             conn.execute(
                 "INSERT INTO audit_log(event_id,action,actor,technical_detail,created_at) VALUES(?,?,?,?,?)",
                 (self.event_id, "participant_deleted", "admin", f"participant={participant_id}", db.now()),
             )
-        return self.response("200 OK", self.admin_page(session, "Participante eliminado de la lista."))
+        message = "Participante eliminado. La vista previa se canceló; vuelve a sortear con la lista actualizada." if preview_cancelled else "Participante eliminado de la lista."
+        return self.response("200 OK", self.admin_page(session, message))
 
     def update_restriction_settings(self, session, form):
         with db.connect(self.database_path) as conn:
